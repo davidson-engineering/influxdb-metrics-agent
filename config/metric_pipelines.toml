@@ -1,5 +1,6 @@
 [TimeLocalizer]
 local_tz = "America/Vancouver"
+offset = [1, 0, 0]             # time offset in hours, minutes, seconds
 
 [ExtraTagger]
 shot_id = "xxxxxx"
@@ -9,9 +10,17 @@ testbed = "PZero"
 
 [Formatter]
 formats_filepath = "config/metric_format.yaml"
+combine_formats = true
 
 [OutlierRemover]
 boundaries_filepath = "config/metric_boundaries.yaml"
+combine_boundaries = true
 
 [PropertyMapper]
 property_mapping_filepath = "config/property_mapping.yaml"
+
+[JSONReader]
+num_processes = 16
+
+[PropertyConstructor]
+property_recipes = { id = "measurement/field" }

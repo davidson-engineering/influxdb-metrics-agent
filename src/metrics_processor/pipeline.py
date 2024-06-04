@@ -9,13 +9,14 @@
 from __future__ import annotations
 from dataclasses import dataclass, asdict, field, is_dataclass
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import json
 import yaml
 import pytz
 import logging
 import time
+import re
 
 from prometheus_client import Histogram, Counter
 
@@ -99,22 +100,86 @@ def get_timezone(timezone_str):
     return TIMEZONE_CACHE[timezone_str]
 
 
-def localize_timestamp(timestamp, timezone_str="UTC") -> datetime:
+def localize_timestamp(timestamp, timezone_str="UTC", offset=(0, 0, 0)) -> datetime:
     """
     Localize a timestamp to a timezone
     :param timestamp: The timestamp to localize
     :param timezone_str: The timezone to localize to
     :return: The localized timestamp
     """
-
+    # Convert to datetime if not already
     if isinstance(timestamp, (int, float)):
         dt_utc = datetime.fromtimestamp(timestamp)
     elif isinstance(timestamp, datetime):
         dt_utc = timestamp
     else:
         raise ValueError("timestamp must be a float, int, or datetime object")
+
+    # Apply offset in the form (0,0,0) representing (hours, minutes, seconds)
+    dt_utc = dt_utc + timedelta(hours=offset[0], minutes=offset[1], seconds=offset[2])
+
+    # Retrieve timezone. Previously used timezones are cached
     timezone = get_timezone(timezone_str)
-    return int(timezone.localize(dt_utc).timestamp())
+
+    return timezone.localize(dt_utc).timestamp()
+
+
+def precompile_regex_keys(formats):
+    return {key: re.compile(key) for key in formats.keys()}
+
+
+def check_metric_fields_length(metric):
+    if len(metric["fields"]) > 1:
+        logging.error(
+            "Metric has more than one field. Run FieldExpander before Formatter",
+            extra={"metric": metric},
+        )
+        raise ValueError(
+            "Metric has more than one field. Run FieldExpander before Formatter"
+        )
+
+
+def get_metric_id(metric):
+    return metric["tags"].get("id", next(iter(metric["fields"])))
+
+
+def deep_merge(dict1, dict2):
+    """
+    Recursively merge two dictionaries.
+
+    :param dict1: The first dictionary.
+    :param dict2: The second dictionary, whose values will overwrite those in dict1 in case of conflicts.
+    :return: A new dictionary that is the result of deeply merging dict2 into dict1.
+    """
+    merged = dict1.copy()  # Create a copy of dict1 to avoid mutating it
+
+    for key, value in dict2.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            # If the key exists in both dictionaries and both values are dicts, merge them recursively
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            # Otherwise, set or overwrite the value in the merged dictionary
+            merged[key] = value
+
+    return merged
+
+
+def build_metric_format(formats, formats_compiled, metric_id, combine=False):
+    # First try to find a direct match
+    format = formats.get(metric_id, {})
+
+    if format and not combine:
+        return format
+
+    # Iterate through all formats and use regex to match each to the metric_id
+    for key, regex in formats_compiled.items():
+        if regex.match(metric_id):
+            if not combine:
+                return formats[key]
+            else:
+                # Merge all matching formats
+                format = deep_merge(formats[key], format)
+    return format
 
 
 # Dataclasses
@@ -188,7 +253,15 @@ class MetricsPipeline(ABC):
         number_of_metrics = len(metrics)
         self.refresh_config()
 
-        results = self.process_method(metrics)
+        metrics = self.remove_none(metrics)
+
+        if metrics:
+            results = self.process_method(metrics)
+        else:
+            logger.info(
+                f"No metrics to process in {self.__class__.__name__}. Continuing"
+            )
+            return None
 
         end_time = time.perf_counter()
 
@@ -206,6 +279,19 @@ class MetricsPipeline(ABC):
 
     def __repr__(self):
         return self.__class__.__name__
+
+    def remove_none(self, metrics):
+        # Remove all None values from metrics
+        number_metrics_initial = len(metrics)
+        metrics = [metric for metric in metrics if metric is not None]
+        number_metrics_final = len(metrics)
+        self.metrics_filtered.labels(
+            agent="metrics_processor",
+            pipeline=self.__class__.__name__,
+            id="None",
+            reason="Invalid metric",
+        ).inc(number_metrics_initial - number_metrics_final)
+        return metrics
 
 
 class AggregateStatistics(MetricsPipeline):
@@ -235,22 +321,8 @@ class AggregateStatistics(MetricsPipeline):
         return metrics_stats
 
 
-class FilterNone(MetricsPipeline):
-    def process_method(self, metrics):
-        # Remove all None values from metrics
-        number_metrics_initial = len(metrics)
-        metrics = [metric for metric in metrics if metric is not None]
-        number_metrics_final = len(metrics)
-        self.metrics_filtered.labels(
-            agent="metrics_processor",
-            pipeline=self.__class__.__name__,
-            id="None",
-            reason="Invalid metric",
-        ).inc(number_metrics_initial - number_metrics_final)
-        return metrics
-
-
 class JSONReader(MetricsPipeline):
+
     def process_method(self, metrics):
         for i, metric in enumerate(metrics):
             if isinstance(metric, str):
@@ -259,6 +331,8 @@ class JSONReader(MetricsPipeline):
 
 
 class ExtraTagger(MetricsPipeline):
+    # NOTE This pipeline is deprecated by Formatter
+    # Use a formatter configuration with wildcards to add tags
 
     def process_method(self, metrics):
 
@@ -276,15 +350,35 @@ class TimeLocalizer(MetricsPipeline):
         self.local_tz = self.config["local_tz"]
         for metric in metrics:
             # logger.debug("TimeLocalizer: Raw time is %s", metric["time"])
-            metric["time"] = localize_timestamp(metric["time"], self.local_tz)
+            local_time = localize_timestamp(
+                metric["time"], timezone_str=self.local_tz, offset=self.config["offset"]
+            )
+            # if local_time differs by more than 59 minutes from actual local time, then offset by one hour using datime.timedelta
+            if abs(local_time - int(time.time())) > 3540:
+                reverse_offset = [-offset for offset in self.config["offset"]]
+                local_time = datetime.fromtimestamp(local_time) + timedelta(
+                    hours=reverse_offset[0],
+                    minutes=reverse_offset[1],
+                    seconds=reverse_offset[2],
+                )
+                local_time = local_time.timestamp()
+            metric["time"] = local_time
         return metrics
 
 
 class TimePrecision(MetricsPipeline):
-
+    # NOTE that this pipeline implements a quick fix to an issue with RTC timestamps
+    # It should be removed for future versions
     def process_method(self, metrics):
+        current_time = time.time()
         for metric in metrics:
-            metric["time"] = int(metric["time"])
+            metric_time = metric["time"]
+            if metric_time > current_time + 60:
+                metric["time"] = (
+                    current_time  # Set to current time if it's ahead by more than a minute
+                )
+            else:
+                metric["time"] = metric_time
         return metrics
 
 
@@ -298,64 +392,86 @@ class FieldExpander(MetricsPipeline):
 class Formatter(MetricsPipeline):
 
     def process_method(self, metrics):
-
         formats = load_yaml_file(self.config["formats_filepath"])
+        self.formats_compiled = precompile_regex_keys(formats)
+        self.combine_formats = self.config.get("combine_formats", False)
 
         metrics = self.format_metrics(metrics, formats)
 
         return metrics
 
     def format_metrics(self, metrics, formats):
-
         for metric in metrics:
-            for k, _ in metric["fields"].items():
+            check_metric_fields_length(metric)
 
-                try:
-                    format = formats[k]
-                except KeyError:
-                    # No format specified for key, continue
-                    continue
+            metric_id = get_metric_id(metric)
+            format = build_metric_format(
+                formats, self.formats_compiled, metric_id, combine=self.combine_formats
+            )
 
-                if format["type"] == "float":
-                    metric["fields"][k] = float(metric["fields"][k])
-                elif format["type"] == "str":
-                    metric["fields"][k] = str(metric["fields"][k])
-                else:
-                    logger.debug(
-                        f"Metric:{metric['fields'][k]} - Type not specified in metric format, defaulting to str"
-                    )
-                    metric["fields"][k] = str(metric["fields"][k])
+            if not format:
+                logging.debug(
+                    f"No format found for metric: {metric_id}",
+                    extra={"metric": metric},
+                )
+                continue
 
-                try:
-                    metric["tags"] = metric["tags"] | format["tags"]
-                except KeyError:
-                    # No additonal tags have been specified for metric, continue
-                    pass
+            field_key = next(iter(metric["fields"]))  # There is only one field
+            field_value = metric["fields"][field_key]
+
+            if format.get("type") == "float":
+                metric["fields"][field_key] = float(field_value)
+            elif format.get("type") == "str":
+                metric["fields"][field_key] = str(field_value)
+            else:
+                logging.debug(
+                    f"Metric:{field_value} - Type not specified in metric format, defaulting to str",
+                    extra={"metric": metric},
+                )
+                metric["fields"][field_key] = str(field_value)
+
+            # Update tags if format contains tags
+            if "tags" in format:
+                metric["tags"] = deep_merge(metric["tags"], format["tags"])
 
         return metrics
 
 
 class PropertyMapper(MetricsPipeline):
-    def process_method(self, metrics):
-        property_mapping = load_yaml_file(self.config["property_mapping_filepath"])
-        metrics = self.map_metric_properties(metrics, property_mapping)
-        return metrics
+    def __init__(self, config=None):
+        super().__init__(config)
+        self.property_mapping = self.load_property_mapping()
 
-    def map_metric_properties(self, metrics, property_mapping):
-        for property, mapping in property_mapping.items():
-            for metric in metrics:
-                for p in metric[property]:
-                    try:
-                        metric[property] = {mapping[p]: metric[property][p]}
-                        logger.debug(
-                            f'Remapped property {property} to {mapping[p]} for metric {metric["measurement"]}'
-                        )
-                    except KeyError:
-                        # No database fieldname specified, use existing field name
-                        logger.debug(
-                            f'No property mapping specified for metric {metric["measurement"]}:{metric[property][p]}, use existing field name'
-                        )
-        return metrics
+    def load_property_mapping(self):
+        # Load the property mapping only once during initialization
+        return load_yaml_file(self.config["property_mapping_filepath"])
+
+    def process_method(self, metrics):
+        # Directly use the loaded property mapping
+        return self.map_metric_properties(metrics)
+
+    def map_metric_properties(self, metrics):
+        # Initialize an empty list to store the updated metrics
+        updated_metrics = []
+
+        for metric in metrics:
+            new_metric = {}
+            for property, values in metric.items():
+                if property in self.property_mapping:
+                    # Map each property using the preloaded mapping
+                    if isinstance(values, (dict, list, tuple)):
+                        new_values = {
+                            self.property_mapping[property].get(p, p): values[p]
+                            for p in values
+                        }
+                    elif isinstance(values, str):
+                        new_values = self.property_mapping[property].get(values, values)
+                    new_metric[property] = new_values
+                else:
+                    new_metric[property] = values
+            updated_metrics.append(new_metric)
+
+        return updated_metrics
 
 
 class OutlierRemover(MetricsPipeline):
@@ -365,6 +481,7 @@ class OutlierRemover(MetricsPipeline):
 
     def process_method(self, metrics):
         boundaries = load_yaml_file(self.config["boundaries_filepath"])
+        self.boundaries_compiled = precompile_regex_keys(boundaries)
         metrics = self.remove_outliers(metrics, boundaries)
         return metrics
 
@@ -372,44 +489,66 @@ class OutlierRemover(MetricsPipeline):
         metrics_filtered = []
         metrics_removed = []
         for metric in metrics:
-            for field in metric["fields"]:
-                boundary = boundaries.get(field)
-                if boundary is None:
-                    metrics_filtered.append(metric)
-                    continue
+            check_metric_fields_length(metric)
+            metric_id = get_metric_id(metric)
+            metric_boundaries = build_metric_format(
+                formats=boundaries,
+                formats_compiled=self.boundaries_compiled,
+                metric_id=metric_id,
+                combine=self.config.get("combine_boundaries", False),
+            )
 
-                value = metric["fields"][field]
-                if isinstance(value, str):
-                    metrics_filtered.append(metric)
-                    continue
+            if not metric_boundaries:
+                logging.debug(
+                    f"No boundary found for metric: {metric_id}",
+                    extra={"metric": metric},
+                )
+                continue
 
-                try:
-                    if "max" in boundary and value > boundary["max"]:
-                        metrics_removed.append(metric)
-                        self.metrics_filtered.labels(
-                            agent="metrics_processor",
-                            pipeline=self.__class__.__name__,
-                            id=field,
-                            reason="Value excceeded max",
-                        ).inc()
-                        continue
-                except KeyError:
-                    pass
+            field_key = next(iter(metric["fields"]))  # There is only one field
+            field_value = metric["fields"][field_key]
 
-                try:
-                    if "min" in boundary and value < boundary["min"]:
-                        metrics_removed.append(metric)
-                        self.metrics_filtered.labels(
-                            agent="metrics_processor",
-                            pipeline=self.__class__.__name__,
-                            id=field,
-                            reason="Value below min",
-                        ).inc()
-                        continue
-                except KeyError:
-                    pass
-
+            if metric_boundaries is None:
                 metrics_filtered.append(metric)
+                continue
+
+            if isinstance(field_value, str):
+                metrics_filtered.append(metric)
+                continue
+
+            try:
+                if (
+                    "max" in metric_boundaries
+                    and field_value > metric_boundaries["max"]
+                ):
+                    metrics_removed.append(metric)
+                    self.metrics_filtered.labels(
+                        agent="metrics_processor",
+                        pipeline=self.__class__.__name__,
+                        id=field,
+                        reason="Value excceeded max",
+                    ).inc()
+                    continue
+            except KeyError:
+                pass
+
+            try:
+                if (
+                    "min" in metric_boundaries
+                    and field_value < metric_boundaries["min"]
+                ):
+                    metrics_removed.append(metric)
+                    self.metrics_filtered.labels(
+                        agent="metrics_processor",
+                        pipeline=self.__class__.__name__,
+                        id=field,
+                        reason="Value below min",
+                    ).inc()
+                    continue
+            except KeyError:
+                pass
+
+            metrics_filtered.append(metric)
 
         number_of_outliers_removed = len(metrics_removed)
 
@@ -417,3 +556,176 @@ class OutlierRemover(MetricsPipeline):
             f"Removed {number_of_outliers_removed} metrics: {shorten_data(str(metrics_removed))}"
         )
         return metrics_filtered
+
+    # def remove_outliers(self, metrics, boundaries):
+    #     metrics_filtered = []
+    #     metrics_removed = []
+    #     for metric in metrics:
+    #         for field in metric["fields"]:
+    #             boundary = boundaries.get(field)
+    #             if boundary is None:
+    #                 metrics_filtered.append(metric)
+    #                 continue
+
+    #             value = metric["fields"][field]
+    #             if isinstance(value, str):
+    #                 metrics_filtered.append(metric)
+    #                 continue
+
+    #             try:
+    #                 if "max" in boundary and value > boundary["max"]:
+    #                     metrics_removed.append(metric)
+    #                     self.metrics_filtered.labels(
+    #                         agent="metrics_processor",
+    #                         pipeline=self.__class__.__name__,
+    #                         id=field,
+    #                         reason="Value excceeded max",
+    #                     ).inc()
+    #                     continue
+    #             except KeyError:
+    #                 pass
+
+    #             try:
+    #                 if "min" in boundary and value < boundary["min"]:
+    #                     metrics_removed.append(metric)
+    #                     self.metrics_filtered.labels(
+    #                         agent="metrics_processor",
+    #                         pipeline=self.__class__.__name__,
+    #                         id=field,
+    #                         reason="Value below min",
+    #                     ).inc()
+    #                     continue
+    #             except KeyError:
+    #                 pass
+
+    #             metrics_filtered.append(metric)
+
+    #     number_of_outliers_removed = len(metrics_removed)
+
+    #     logger.debug(
+    #         f"Removed {number_of_outliers_removed} metrics: {shorten_data(str(metrics_removed))}"
+    #     )
+    #     return metrics_filtered
+
+
+class BinaryOperations(MetricsPipeline):
+
+    config_filepath_key = "binary_operations_filepath"
+
+    def process_method(self, metrics):
+        operation_list = load_yaml_file(self.config[self.config_filepath_key])
+        metrics = self.operations(metrics, operation_list)
+        return metrics
+
+    def operations(self, metrics, operation_list):
+        for operation in operation_list:
+            operation = operation_list[operation]
+            op = operation["operation"]
+            operands = operation["operands"]
+            operands_metrics = []
+            for metric in metrics:
+                for field in metric["fields"]:
+                    if field in operands:
+                        operands_metrics.append(metric)
+            operands_value = [next(operand["fields"]) for operand in operands_metrics]
+            operands_time = [operand["time"] for operand in operands_metrics]
+            time = None
+            try:
+                if op == "add":
+                    result = sum(operands_value)
+                elif op == "subtract":
+                    result = operands_value[0] - operands_value[1]
+                elif op == "multiply":
+                    result = operands_value[0] * operands_value[1]
+                elif op == "divide":
+                    if operands_value[1] == 0:
+                        raise ValueError("Division by zero is not allowed")
+                    result = operands_value[0] / operands_value[1]
+                elif op == "max":
+                    result = max(operands_value)
+                elif op == "min":
+                    result = min(operands_value)
+                else:
+                    raise ValueError("Invalid operation")
+
+                try:
+                    time = max(operands_time)
+                except ValueError:
+                    time = datetime.now()
+
+                new_metric = {
+                    "measurement": operands[0]["measurement"],
+                    "fields": {operation["result"]: result},
+                    "tags": operands[0].get("tags", {}),
+                    "time": time,
+                }
+                metrics.append(new_metric)
+
+            except ValueError as e:
+                logging.error(f"Error in binary operation: {e}")
+                continue
+
+        return metrics
+
+
+class PropertyConstructor(MetricsPipeline):
+
+    def __init__(self, config=None) -> None:
+        super().__init__(config=config)
+        self.property_recipes = self.config.get("property_recipes")
+        self.property_group = self.config.get("property_group")
+
+    def process_method(self, metrics):
+
+        def build_properties(recipes, metric):
+
+            # Check if metric has more than one field
+            if len(metric["fields"]) > 1:
+                message = "Metric has more than one field, cannot build properties. This is resolved by applying FieldExpander before PropertyConstructor"
+                logger.error(message)
+                raise ValueError(message)
+
+            new_fields = {}
+
+            for property, structure in recipes.items():
+                property_fields = structure.split("/")
+                try:
+                    property_value = []
+                    for field in property_fields:
+                        if field == "field":
+                            property_value.append(next(iter(metric["fields"])))
+                        else:
+                            property_value.append(metric[field])
+                    property_value = "/".join(property_value)
+                except KeyError:
+                    message = f"Property field not found in metric: {property_fields}"
+                    logger.error(message)
+                    raise KeyError(message)
+
+                new_fields[property] = property_value
+
+            if new_fields:
+                return new_fields
+            else:
+                return None
+
+        if not self.property_recipes:
+            logger.warning(
+                f"No property recipes specified for {self.__class__.__name__}. Continuing without modification"
+            )
+            return metrics
+
+        for i, metric in enumerate(metrics):
+
+            new_properties = build_properties(self.property_recipes, metric)
+            # Note this will only work for creating property groups that are dictionaries
+            # Other types are not considered
+            if new_properties:
+                if self.property_group:
+                    # Catch the case where the property group is None
+                    property_group = metric.get(self.property_group) or {}
+                    metrics[i][self.property_group] = property_group | new_properties
+                else:
+                    metrics[i] = metric | new_properties
+
+        return metrics

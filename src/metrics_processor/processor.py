@@ -185,14 +185,22 @@ class MetricsProcessor:
                 # dump buffer to list of metrics
                 metrics = self.input_buffer.dump(self.batch_size_processing)
                 for pipeline in self.pipelines:
-                    number_metrics_initial = len(metrics)
-                    metrics = pipeline.process(metrics)
-                    number_metrics_final = len(metrics)
-                    logger.info(
-                        f"Processed {number_metrics_initial} metrics using {pipeline}. {number_metrics_final} metrics output"
-                    )
+                    try:
+                        number_metrics_initial = len(metrics)
+                        metrics = pipeline.process(metrics)
+                        number_metrics_final = len(metrics)
+                        logger.info(
+                            f"Processed {number_metrics_initial} metrics using {pipeline}. {number_metrics_final} metrics output"
+                        )
+                    except TypeError:
+                        logger.warning(
+                            "No metrics were extracted during processing of the buffer",
+                            extra={"pipeline": str(pipeline)},
+                        )
+                        return
                 self.output_buffer.extend(metrics)
                 self.metrics_processed.labels("metrics_processor").inc(len(metrics))
+
         except Exception as e:
             logger.error(f"Error processing metrics: {e}", extra={"metrics": metrics})
 

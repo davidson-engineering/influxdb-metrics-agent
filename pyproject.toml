@@ -27,6 +27,7 @@ dependencies = [
   "pandas>=2.2.0",
   "pyarrow>=15.0.0",
   "tomli >= 1.1.0 ; python_version < '3.11'",
+  "prometheus_client>=0.20.0",
   "buffered @ git+https://github.com/generalmattza/buffered.git@v1.0.1",
 ]
 
@@ -35,7 +36,10 @@ dependencies = [
 version = { attr = "metrics_processor.__version__" }
 
 [project.optional-dependencies]
-test = ["pytest >= 8.0.0"]
+test = [
+  "pytest >= 8.0.0",
+  "mqtt-node-network @ git+https://github.com/generalmattza/mqtt-node-network.git@v1.3.1",
+]
 
 [project.urls]
 homepage = "https://davidson.engineering"

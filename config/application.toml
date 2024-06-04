@@ -1,3 +1,5 @@
+secrets_filepath = ".env"
+
 [processor]
 update_interval = 1
 input_buffer_length = 65_536
@@ -8,3 +10,22 @@ batch_size = 1_000
 enable_prometheus_server = false
 prometheus_port = 8_000
 update_interval = 60
+
+
+# For testing
+[mqtt.client]
+name = "mqtt-client-testing"
+node_id = "metrics_manager_pzero"
+subscribe_topics = ["prototype-zero/#"]
+subscribe_qos = 0
+
+[mqtt.broker]
+hostname = "gfyvrdatadash"
+# hostname = "emqx-broker"
+port = 1_883
+timeout = 5
+
+[mqtt.node_network]
+topic_structure = "machine/level/category/module/measurement/field*"
+enable_prometheus_server = false
+prometheus_port = 8_000

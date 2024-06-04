@@ -1,0 +1,10 @@
+
+
+lower_pressure_minimum:
+  operation: min
+  machine: pzero
+  module: sensorbox_cartridge_pressure
+  operands: 
+   - hornet-torr
+   - stinger-torr
+  result: lower_pressure-torr
